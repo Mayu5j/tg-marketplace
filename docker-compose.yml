@@ -56,6 +56,9 @@ services:
       - ENCRYPTION_KEY=gJr_vI6SXZmG1v2mG5Xm_i9M_zP6gY2R9X7l-mE9P_c=
       - CRYPTO_BOT_TOKEN=YOUR_CRYPTO_BOT_TOKEN
       - TON_WALLET_ADDRESS=EQC...YOUR_WALLET_ADDRESS
+      - TON_RATE_API_URL=https://tonapi.io/v2/rates
+      - TONAPI_KEY=
+      - TON_USDT_RATE=
       - APP_URL=https://marketplace-bot.my-domain.com
     depends_on:
       db:

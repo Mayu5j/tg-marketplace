@@ -57,9 +57,14 @@ class Settings(BaseSettings):
         default="https://toncenter.com/api/v2/getTransactions",
         description="Toncenter API endpoint for getTransactions"
     )
+    TON_RATE_API_URL: str = Field(
+        default="https://tonapi.io/v2/rates",
+        description="TON rate API endpoint used to quote TON invoices"
+    )
+    TONAPI_KEY: Optional[str] = Field(default=None, description="Optional TonAPI bearer token for rates")
     TON_USDT_RATE: Optional[float] = Field(
         default=None,
-        description="Manual rate: 1 TON = X USDT for TON transfer conversion"
+        description="Manual fallback rate: 1 TON = X USDT for TON transfer conversion"
     )
 
     # Order Reservation TTL (in seconds)

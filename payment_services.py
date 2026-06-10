@@ -97,6 +97,49 @@ class TonWatcherService:
         # Toncenter JSON-RPC or REST endpoint
         self.base_url = settings.TONCENTER_BASE_URL
 
+    @staticmethod
+    def _decode_ton_comment_payload(payload: str, *, strip_opcode: bool = False) -> str:
+        """
+        Decode TON message comments returned by Toncenter.
+
+        TON wallets/APIs are inconsistent: some return a ready text comment, while
+        others put a base64-encoded comment into msg.dataText.text or msg.dataRaw.body.
+        This helper accepts both variants and returns a plain user-visible comment.
+        """
+        if not payload:
+            return ""
+
+        text = str(payload).strip()
+        candidates = [text]
+
+        # Try base64 decoding even for msg.dataText: Tonkeeper/Toncenter can expose
+        # comments like "TUtQXzNf...", which is base64 for "MKP_3_...".
+        try:
+            padded_text = text + "=" * (-len(text) % 4)
+            decoded = b64decode(padded_text, validate=True)
+        except (binascii.Error, ValueError):
+            decoded = b""
+
+        if decoded:
+            byte_candidates = [decoded]
+            if strip_opcode and len(decoded) > 4:
+                byte_candidates.insert(0, decoded[4:])
+
+            for raw in byte_candidates:
+                decoded_text = raw.decode("utf-8", errors="ignore").strip("\x00\r\n ")
+                if decoded_text and decoded_text not in candidates:
+                    candidates.append(decoded_text)
+
+        # Prefer the marketplace marker if any candidate contains it. This handles
+        # decoded raw payloads with an opcode/prefix as well as plain comments.
+        for candidate in candidates:
+            marker_pos = candidate.find("MKP_")
+            if marker_pos >= 0:
+                return candidate[marker_pos:].strip()
+
+        # Otherwise return the most decoded readable version we found.
+        return candidates[-1] if candidates else ""
+
     async def fetch_recent_wallet_transactions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Retrieves the latest transactions of the hot wallet to check against active order markers.
@@ -151,6 +194,75 @@ class TonWatcherService:
             
         return []
 
+
+    async def fetch_ton_usdt_rate(self) -> Optional[float]:
+        """Fetch the current 1 TON price in USDT/USD for creating fixed TON invoices."""
+        headers = {}
+        if settings.TONAPI_KEY:
+            headers["Authorization"] = f"Bearer {settings.TONAPI_KEY}"
+
+        params = {"tokens": "ton", "currencies": "usd"}
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    settings.TON_RATE_API_URL,
+                    params=params,
+                    headers=headers,
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    rate = self._extract_ton_usd_rate(data)
+                    if rate and rate > 0:
+                        logger.info(f"TON rate fetched from API: 1 TON = {rate} USD")
+                        return rate
+                    logger.error(f"TON rate API response did not contain a usable TON/USD rate: {data}")
+                else:
+                    logger.error(f"TON rate API returned HTTP {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.exception(f"Error fetching TON/USD rate from API: {e}")
+
+        if settings.TON_USDT_RATE and settings.TON_USDT_RATE > 0:
+            logger.warning(f"Falling back to manual TON_USDT_RATE={settings.TON_USDT_RATE}")
+            return settings.TON_USDT_RATE
+
+        return None
+
+    @staticmethod
+    def _extract_ton_usd_rate(data: Dict[str, Any]) -> Optional[float]:
+        """Extract TON/USD rate from TonAPI-style rates responses with schema tolerance."""
+        possible_token_keys = ("TON", "ton", "Toncoin", "toncoin")
+        possible_currency_keys = ("USD", "usd", "USDT", "usdt")
+
+        rates = data.get("rates") if isinstance(data, dict) else None
+        if not isinstance(rates, dict):
+            return None
+
+        for token_key in possible_token_keys:
+            token_info = rates.get(token_key)
+            if not isinstance(token_info, dict):
+                continue
+
+            prices = token_info.get("prices")
+            if isinstance(prices, dict):
+                for currency_key in possible_currency_keys:
+                    value = prices.get(currency_key)
+                    if value is not None:
+                        try:
+                            return float(value)
+                        except (TypeError, ValueError):
+                            pass
+
+            for currency_key in possible_currency_keys:
+                value = token_info.get(currency_key)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        pass
+
+        return None
+
     def parse_transaction(self, tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Parses raw Toncenter transaction model.
@@ -176,44 +288,34 @@ class TonWatcherService:
             
             logger.debug(f"TX Parser: msg_data_type={msg_data_type}, msg_data keys={list(msg_data.keys())}")
             
-            # Plain text comment could be direct text or base64-encoded text
+            # Plain text comment could be direct text or base64-encoded text.
+            # Tonkeeper/Toncenter may return msg.dataText.text as base64, e.g.
+            # "TUtQXzNfMTc4..." -> "MKP_3_178...". Normalize it before matching.
             if msg_data.get("@type") == "msg.dataText":
-                comment = msg_data.get("text", "").strip()
-                logger.info(f"TX Parser: Extracted TEXT comment: '{comment}' from tx {tx_hash[:16] if tx_hash else 'unknown'}...")
+                raw_text = msg_data.get("text", "")
+                comment = self._decode_ton_comment_payload(raw_text)
+                logger.info(
+                    f"TX Parser: Extracted TEXT comment: raw='{raw_text}', normalized='{comment}' "
+                    f"from tx {tx_hash[:16] if tx_hash else 'unknown'}..."
+                )
             elif msg_data.get("@type") == "msg.dataRaw":
                 body = msg_data.get("body", "")
                 if body:
-                    try:
-                        decoded = b64decode(body)
-                        # Try to extract UTF-8 text from decoded body
-                        # For TON messages, first 4 bytes are usually the op code
-                        # Comment text usually starts from byte 4 onwards
-                        if len(decoded) > 4:
-                            comment_bytes = decoded[4:]
-                        else:
-                            comment_bytes = decoded
-                        
-                        comment = comment_bytes.decode("utf-8", errors="ignore").strip()
-                        logger.info(f"TX Parser: Decoded RAW comment: '{comment}' from tx {tx_hash[:16] if tx_hash else 'unknown'}... (total bytes: {len(decoded)}, decoded bytes: {len(comment_bytes)})")
-                    except (binascii.Error, ValueError) as e:
-                        logger.warning(f"TX Parser: Failed to decode base64 body: {e}")
-                        comment = ""
+                    comment = self._decode_ton_comment_payload(body, strip_opcode=True)
+                    logger.info(
+                        f"TX Parser: Decoded RAW comment: '{comment}' "
+                        f"from tx {tx_hash[:16] if tx_hash else 'unknown'}..."
+                    )
             else:
                 logger.debug(f"TX Parser: Unknown msg_data type '{msg_data_type}' for tx {tx_hash[:16] if tx_hash else 'unknown'}...")
             
-            # If still no comment, try to extract from body field directly
+            # If still no comment, try to extract from body field directly.
             if not comment and "body" in in_msg:
                 body = in_msg.get("body", "")
                 if body:
-                    try:
-                        decoded = b64decode(body)
-                        if len(decoded) > 4:
-                            comment = decoded[4:].decode("utf-8", errors="ignore").strip()
-                        else:
-                            comment = decoded.decode("utf-8", errors="ignore").strip()
+                    comment = self._decode_ton_comment_payload(body, strip_opcode=True)
+                    if comment:
                         logger.info(f"TX Parser: Extracted comment from in_msg.body: '{comment}'")
-                    except Exception as e:
-                        logger.debug(f"TX Parser: Failed to extract from in_msg.body: {e}")
             
             return {
                 "amount": value_ton,

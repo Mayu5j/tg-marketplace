@@ -131,7 +131,12 @@ class AccountRepository(BaseRepository):
 
 class OrderRepository(BaseRepository):
     async def create_invoice_with_lock(
-        self, user_id: int, account_id: int, payment_method: PaymentMethod, ttl_seconds: int
+        self,
+        user_id: int,
+        account_id: int,
+        payment_method: PaymentMethod,
+        ttl_seconds: int,
+        ton_rate_usdt: Optional[float] = None,
     ) -> Order:
         """
         Creates a pending order without reserving the account.
@@ -143,14 +148,18 @@ class OrderRepository(BaseRepository):
         if not account:
             raise ValueError("Account not found")
 
-        if account.status == AccountStatus.SOLD:
-            raise ValueError("This account is already sold")
+        if account.status != AccountStatus.AVAILABLE:
+            raise ValueError("This account is not available for purchase")
 
         # Create the unpaid invoice/order
         expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl_seconds)
         
-        # Unique comments or UUIDs can be linked for blockchain wallet matching
-        ton_comment = f"MKP_{account.id}_{int(datetime.datetime.utcnow().timestamp())}" if payment_method == PaymentMethod.TON_TRANSFER else None
+        ton_expected_amount = None
+        if payment_method == PaymentMethod.TON_TRANSFER:
+            if not ton_rate_usdt or ton_rate_usdt <= 0:
+                raise ValueError("TON rate is required for TON transfer orders")
+            # Freeze the TON amount at invoice creation time so later rate changes do not affect matching.
+            ton_expected_amount = round(account.price / ton_rate_usdt, 3)
 
         order = Order(
             user_id=user_id,
@@ -159,12 +168,17 @@ class OrderRepository(BaseRepository):
             price_stars=account.price_stars,
             status=OrderStatus.PENDING,
             payment_method=payment_method,
-            ton_comment=ton_comment,
+            ton_expected_amount=ton_expected_amount,
+            ton_rate_usdt=ton_rate_usdt if payment_method == PaymentMethod.TON_TRANSFER else None,
             expires_at=expires_at
         )
         order.account = account
         self.session.add(order)
         await self.session.flush()
+
+        if payment_method == PaymentMethod.TON_TRANSFER:
+            order.ton_comment = f"MKP_{order.id}_{int(datetime.datetime.utcnow().timestamp())}"
+            await self.session.flush()
         
         return order
 
@@ -192,7 +206,13 @@ class OrderRepository(BaseRepository):
         )
         return result.scalar_one_or_none()
 
-    async def apply_successful_payment(self, order_id: int, tx_hash: Optional[str] = None, asset: str = "USD") -> Tuple[Order, Account]:
+    async def apply_successful_payment(
+        self,
+        order_id: int,
+        tx_hash: Optional[str] = None,
+        asset: str = "USD",
+        amount: Optional[float] = None,
+    ) -> Tuple[Order, Account]:
         # Lock order and account for winner-takes-all flow
         order_res = await self.session.execute(
             select(Order).where(Order.id == order_id).options(selectinload(Order.account), selectinload(Order.user)).with_for_update()
@@ -217,7 +237,7 @@ class OrderRepository(BaseRepository):
         # Record payment item
         payment = Payment(
             order_id=order.id,
-            amount=order.price,
+            amount=amount if amount is not None else order.price,
             asset=asset,
             tx_hash=tx_hash
         )
