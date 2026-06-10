@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: marketplace_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_secret
+      POSTGRES_DB: marketplace_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: marketplace_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Combined Bot Engine and Webhook API Web Server
+  api_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: marketplace_api_bot
+    restart: always
+    command: python -m marketplace_bot.main
+    ports:
+      - "8000:8000"
+    environment:
+      - BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+      - ADMIN_IDS=12345678,98765432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres_secret
+      - POSTGRES_DB=marketplace_db
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ENCRYPTION_KEY=gJr_vI6SXZmG1v2mG5Xm_i9M_zP6gY2R9X7l-mE9P_c=
+      - CRYPTO_BOT_TOKEN=YOUR_CRYPTO_BOT_TOKEN
+      - TON_WALLET_ADDRESS=EQC...YOUR_WALLET_ADDRESS
+      - APP_URL=https://marketplace-bot.my-domain.com
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Dedicated Nginx reverse-proxy
+  nginx:
+    image: nginx:alpine
+    container_name: marketplace_proxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - api_bot
+
+volumes:
+  pgdata:
+  redisdata:
