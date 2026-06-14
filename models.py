@@ -106,6 +106,8 @@ class Order(Base):
     # Specific attributes for matching TON transfers or CryptoBot billing
     payment_invoice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True, index=True)
     ton_comment: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    ton_expected_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ton_rate_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, index=True)

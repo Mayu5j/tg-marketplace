@@ -16,7 +16,7 @@ from marketplace_bot.models import PaymentMethod, AccountStatus, OrderStatus
 from marketplace_bot.repositories import (
     UserRepository, RegionRepository, AccountRepository, OrderRepository
 )
-from marketplace_bot.payment_services import CryptoBotClient, TelegramStarsPayments
+from marketplace_bot.payment_services import CryptoBotClient, TelegramStarsPayments, TonWatcherService
 from marketplace_bot.telethon_worker import get_telethon_manager
 
 logger = logging.getLogger("bot_handlers")
@@ -253,8 +253,8 @@ async def process_buy_account(callback: CallbackQuery, state: FSMContext, order_
         await callback.answer()
         return
 
-    if account.status == AccountStatus.SOLD:
-        await callback.message.answer("❌ Извините, но этот аккаунт уже куплен другим пользователем. Выберите другой номер.")
+    if account.status != AccountStatus.AVAILABLE:
+        await callback.message.answer("❌ Извините, но этот аккаунт сейчас недоступен для покупки. Выберите другой номер.")
         await callback.answer()
         return
 
@@ -335,13 +335,24 @@ async def trigger_order_invoice_creation(callback: CallbackQuery, state: FSMCont
     }
     payment_method = method_mapping[method_str]
     
+    ton_rate_usdt = None
+    if payment_method == PaymentMethod.TON_TRANSFER:
+        ton_rate_usdt = await TonWatcherService().fetch_ton_usdt_rate()
+        if not ton_rate_usdt or ton_rate_usdt <= 0:
+            await callback.message.answer(
+                "❌ Не удалось получить актуальный курс TON. Попробуйте позже или выберите другой способ оплаты."
+            )
+            await callback.answer()
+            return
+
     try:
         # Atomic lock and create reservation structure
         order = await order_repo.create_invoice_with_lock(
             user_id=callback.from_user.id,
             account_id=account_id,
             payment_method=payment_method,
-            ttl_seconds=settings.ORDER_RESERVATION_TTL_SECS
+            ttl_seconds=settings.ORDER_RESERVATION_TTL_SECS,
+            ton_rate_usdt=ton_rate_usdt
         )
     except Exception as e:
         logger.error(f"Order create validation error: {e}")
@@ -397,20 +408,20 @@ async def trigger_order_invoice_creation(callback: CallbackQuery, state: FSMCont
         await callback.message.answer(instructions, reply_markup=kbd, parse_mode="HTML")
 
     elif payment_method == PaymentMethod.TON_TRANSFER:
-        # TON Keeper Direct matching memo
-        ton_rate = settings.TON_USDT_RATE
-        if ton_rate and ton_rate > 0:
-            ton_amount = round(order.price / ton_rate, 4)
-            amount_line = f"Отправьте ровно <b>{ton_amount} TON</b> (≈ {order.price} USDT)"
-        else:
-            amount_line = f"Отправьте ровно <b>{order.price} TON</b> (цена в USDT, требуется конвертация)"
+        # TON Keeper Direct matching memo. The amount is fixed on the order at invoice creation time.
+        ton_amount = order.ton_expected_amount
+        amount_line = (
+            f"Отправьте ровно <b>{ton_amount:.3f} TON</b> "
+            f"(цена аккаунта: {order.price} USDT, курс заказа: 1 TON = {order.ton_rate_usdt:.4f} USDT)"
+        )
         instructions = (
             f"💎 <b>Инструкция оплаты через TON Wallet Transfer</b>\n\n"
             f"{amount_line} на наш горячий кошелек:\n"
             f"<code>{settings.TON_WALLET_ADDRESS}</code>\n\n"
             f"⚠️ <b>ВАЖНО:</b> Укажите этот уникальный комментарий при отправке транзакции, иначе бот не сможет зафиксировать платеж:\n"
             f"<code>{order.ton_comment}</code>\n\n"
-            f"Бот мониторит сеть TON блокчейна каждые 30 сек. По завершению, перевод обработается автоматически."
+            f"Бот мониторит сеть TON блокчейна каждые 30 сек. Заказ будет засчитан только если "
+            f"по этому комментарию придет ровно указанная сумма TON."
         )
         kbd = InlineKeyboardMarkup(inline_keyboard=[
             [

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import datetime
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, status
@@ -14,12 +15,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Database Engine
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import text
 
 # Imports from custom modular layers
 from marketplace_bot.config import settings
 from marketplace_bot.models import Base, OrderStatus, AccountStatus, PaymentMethod
 from marketplace_bot.repositories import (
-    UserRepository, RegionRepository, AccountRepository, OrderRepository, AdminLogRepository
+    UserRepository, RegionRepository, AccountRepository, OrderRepository, AdminLogRepository,
+    PaymentLogRepository
 )
 from marketplace_bot.telethon_worker import get_telethon_manager, set_auth_code_callback
 from marketplace_bot.payment_services import TonWatcherService, CryptoBotClient
@@ -147,50 +150,73 @@ async def job_ton_wallet_watcher():
                     logger.warning(f"TON Watcher: No order found for comment '{comment}' in PENDING status")
                     continue
                     
-                logger.info(f"TON Watcher: Order {order.id} found, checking amount")
-                # Double-check invoice expected coin amounts
-                # Scale price of TON or verify rates
-                if not settings.TON_USDT_RATE or settings.TON_USDT_RATE <= 0:
+                logger.info(f"TON Watcher: Order {order.id} found, checking fixed TON amount")
+                expected_amount = order.ton_expected_amount
+                if expected_amount is None:
                     logger.error(
-                        f"TON Watcher: TON_USDT_RATE not configured or invalid! "
-                        f"Set TON_USDT_RATE in .env (e.g., TON_USDT_RATE=7.5 means 1 TON = 7.5 USDT). "
-                        f"Current value: {settings.TON_USDT_RATE}"
+                        f"TON Watcher: Order {order.id} has no fixed TON amount. "
+                        "Ask the buyer to create a fresh TON invoice."
                     )
-                    continue  # Skip payment matching until rate is configured
-                
-                expected_amount = order.price / settings.TON_USDT_RATE
-                
+                    continue
+
                 amount_diff = abs(amount - expected_amount)
-                logger.info(f"TON Watcher: Amount check: received={amount} TON, expected={expected_amount} TON (price={order.price} USDT / rate={settings.TON_USDT_RATE}), diff={amount_diff}")
-                
-                if amount_diff < 0.05: # Allow small margin (0.05 TON for fees)
+                tolerance = 0.0005
+                logger.info(
+                    f"TON Watcher: Amount check: received={amount:.9f} TON, "
+                    f"expected={expected_amount:.3f} TON, diff={amount_diff:.9f} TON, "
+                    f"locked_rate={order.ton_rate_usdt} USDT"
+                )
+
+                if amount_diff <= tolerance:
                     logger.info(f"Payment MATCHED! Order ID: {order.id}, Tx: {tx_hash}")
-                    # Apply payment
-                    await order_repo.apply_successful_payment(order.id, tx_hash=tx_hash, asset="TON")
+                    paid_order, paid_account = await order_repo.apply_successful_payment(
+                        order.id,
+                        tx_hash=tx_hash,
+                        asset="TON",
+                        amount=amount
+                    )
                     await session.commit()
+
+                    if paid_order.status != OrderStatus.PAID:
+                        logger.warning(
+                            f"TON payment tx {tx_hash} matched comment {comment}, but order {order.id} "
+                            f"was not marked PAID (status={paid_order.status.value}). Delivery skipped."
+                        )
+                        continue
+
+                    interception_ok = False
                     try:
-                        await telethon_manager.start_login_code_interception(
-                            phone=order.account.phone,
-                            api_id=order.account.api_id,
-                            api_hash=order.account.api_hash,
-                            encrypted_session=order.account.encrypted_session,
-                            order_id=order.id
+                        interception_ok = await telethon_manager.start_login_code_interception(
+                            phone=paid_account.phone,
+                            api_id=paid_account.api_id,
+                            api_hash=paid_account.api_hash,
+                            encrypted_session=paid_account.encrypted_session,
+                            order_id=paid_order.id
                         )
                     except Exception as e:
-                        logger.error(f"Failed to start code interception for TON order {order.id}: {e}")
-                    
+                        logger.error(f"Failed to start code interception for TON order {paid_order.id}: {e}")
+
                     # Deliver keys & notify
                     bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-                    # Forward user to start active listening
+                    listen_line = (
+                        "Бот уже слушает входящие сообщения этого аккаунта."
+                        if interception_ok
+                        else "⚠️ Бот не смог автоматически запустить прослушивание кодов. Обратитесь в поддержку."
+                    )
                     await bot.send_message(
-                        chat_id=order.user_id,
+                        chat_id=paid_order.user_id,
                         text=f"✅ <b>Оплата в TON успешно зачислена!</b>\n"
-                             f"ID транзакции: <code>{tx_hash}</code>\n\n"
-                             f"Бот уже слушает входящие сообщения этого аккаунта.\n"
+                             f"ID транзакции: <code>{tx_hash}</code>\n"
+                             f"Получено: <b>{amount:.3f} TON</b>\n\n"
+                             f"{listen_line}\n"
                              f"Откройте Telegram и запросите код — он придет сюда автоматически."
                     )
                 else:
-                    logger.warning(f"TON Watcher: Amount mismatch for order {order.id}: diff={amount_diff} TON (>0.05)")
+                    logger.warning(
+                        f"TON Watcher: Amount mismatch for order {order.id}: "
+                        f"received={amount:.9f} TON, expected={expected_amount:.3f} TON, "
+                        f"diff={amount_diff:.9f} TON (> {tolerance})"
+                    )
             elif comment:
                 logger.debug(f"TON Watcher: Comment does not start with MKP_: '{comment}'")
             else:
@@ -220,17 +246,16 @@ async def db_session_middleware(handler, event, data):
 async def lifespan(app: FastAPI):
     # 0. Validate TON configuration
     if settings.TON_WALLET_ADDRESS and settings.TON_WALLET_ADDRESS != "EQC...YOUR_TELEGRAM_TON_WALLET":
-        if not settings.TON_USDT_RATE or settings.TON_USDT_RATE <= 0:
-            logger.warning(
-                "⚠️  TON WALLET is configured but TON_USDT_RATE is missing or invalid! "
-                "TON payments will NOT work until you set TON_USDT_RATE in .env. "
-                "Example: TON_USDT_RATE=7.5 (meaning 1 TON = 7.5 USDT). "
-                "Get current rate from: https://stonfi.app or similar"
-            )
+        logger.info(
+            "TON wallet is configured. TON invoices will use TON_RATE_API_URL for live rates "
+            "and TON_USDT_RATE only as a manual fallback."
+        )
     
     # 1. Database migration/creation for rapid deploy setup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS ton_expected_amount DOUBLE PRECISION"))
+        await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS ton_rate_usdt DOUBLE PRECISION"))
     logger.info("SqlAlchemy database schemas loaded on engine.")
 
     # 2. Redis Initializer for FSM Storage
